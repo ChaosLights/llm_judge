@@ -329,14 +329,14 @@ def make_steering_hook(W: torch.Tensor, alpha: float = 1.0):
     W = W / (W.norm(dim=1, keepdim=True) + 1e-8)  # (r, d)
 
     def hook(module: nn.Module, inp, out):
-        # out: (batch, seq, d)
         if not isinstance(out, torch.Tensor):
             return out
         h = out
-        # coeff: (batch, seq, r)
-        coeff = torch.einsum("bsd,rd->bsr", h, W)
-        # proj: (batch, seq, d)
-        proj = torch.einsum("bsr,rd->bsd", coeff, W)
+        # 确保 W 和 h 在同一个 device & dtype
+        W_local = W.to(device=h.device, dtype=h.dtype)
+
+        coeff = torch.einsum("bsd,rd->bsr", h, W_local)
+        proj = torch.einsum("bsr,rd->bsd", coeff, W_local)
         return h - alpha * proj
 
     return hook
