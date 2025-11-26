@@ -289,7 +289,7 @@ def compute_top_layers_and_bias_dirs(
             mean_scores.append(float(np.mean(scores)))
 
     # Select top-3 layers (or fewer if the model has fewer layers)
-    k = min(3, num_layers)
+    k = min(6, num_layers)
     sorted_idx = np.argsort(mean_scores)
     top_layers = sorted_idx[-k:].tolist()
 
@@ -479,7 +479,7 @@ def evaluate_judge(
             h.remove()
 
 
-def score_metrics(metrics: Dict[str, float], lambda_bias: float = 0.5) -> float:
+def score_metrics(metrics: Dict[str, float], lambda_bias: float = 1.0) -> float:
     """
     Simple scalar objective to pick alpha on the val set:
       score = avg_pah - lambda_bias * total_left_bias
