@@ -2,23 +2,26 @@
 # -*- coding: utf-8 -*-
 
 """
-End-to-end Align-Trace debias pipeline for JudgeLM.
+Align-Trace debias pipeline for JudgeLM, with evaluation matching the proposal-style judge:
 
-Steps:
- 1) Load train/val/test triplet JSONL datasets (converted from LMSYS Arena).
- 2) Run Align-Trace on a subset of the train set to find position-bias-related layers.
- 3) Learn a low-rank bias subspace (via PCA) for those layers.
- 4) On the val set, grid-search steering strength alpha to trade off PAH vs position bias.
- 5) On the test set, evaluate baseline and debiased JudgeLM and save metrics.
+- For each triplet (question, answer_a, answer_b), we run the judge twice:
+    1) Sequential:  Answer 1 = A (answer_a), Answer 2 = B (answer_b)
+    2) Reversed:    Answer 1 = B (answer_b), Answer 2 = A (answer_a)
 
-This script assumes your JudgeLM is a HuggingFace AutoModelForCausalLM-compatible model
-that outputs "A"/"B"/"TIE" by emitting one of these tokens as the final token.
+- The judge is prompted to output exactly one token: "A", "B", or "TIE".
+- We then compute:
+    * PAH_seq / PAH_rev: accuracy vs. human preference under seq/rev order
+    * left-choice rate under seq/rev order
+    * tie rate under seq/rev order
+    * PBI = left_rate_seq - left_rate_rev
+    * avg_pah = (PAH_seq + PAH_rev) / 2
+
+Align-Trace itself (finding biased layers and bias subspace) still uses a
+logit-based preference score internally, but evaluation is generation-based.
 """
 
 import argparse
 import json
-import math
-import os
 import random
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
@@ -57,17 +60,26 @@ def load_triplet_data(path: str) -> List[Dict[str, Any]]:
 def build_judge_prompt(question: str, left_answer: str, right_answer: str) -> str:
     """Template for JudgeLM prompt where 'left_answer' is Answer 1 and 'right_answer' is Answer 2."""
     return (
-        "You are an impartial judge. You will read a user question and two candidate answers.\n\n"
+        "You are an impartial and strict judge.\n"
+        "You will be given a user question and two candidate answers (Answer 1 and Answer 2).\n"
+        "Your task is to decide which answer is better overall.\n\n"
+        "Criteria include helpfulness, correctness, depth, safety, and following instructions.\n\n"
+        "Read the question and both answers carefully, then output exactly ONE token:\n"
+        '- "A" if Answer 1 (left) is better\n'
+        '- "B" if Answer 2 (right) is better\n'
+        '- "TIE" if they are roughly tied\n\n'
+        "Do NOT explain your choice.\n\n"
         "[Question]\n"
         f"{question}\n\n"
         "[Answer 1]\n"
         f"{left_answer}\n\n"
         "[Answer 2]\n"
         f"{right_answer}\n\n"
-        'Your job is to decide which answer better follows the instructions, is more helpful, '
-        'and is safer.\n\n'
-        'Respond with a single token only: "A", "B", or "TIE".'
+        "Your decision (A, B, or TIE):"
     )
+
+
+# ---------- Helpers for Align-Trace internals (logit-based) ----------
 
 
 def decode_ab_tie_from_logits(logits: torch.Tensor, tokenizer) -> str:
@@ -78,6 +90,11 @@ def decode_ab_tie_from_logits(logits: torch.Tensor, tokenizer) -> str:
     last = logits[0, -1, :]  # (vocab,)
     id_A = tokenizer("A", add_special_tokens=False).input_ids[0]
     id_B = tokenizer("B", add_special_tokens=False).input_ids[0]
+
+    # For "TIE", we take the first token id produced by the tokenizer;
+    # if "TIE" is split into multiple tokens, this is still fine because
+    # the model is explicitly instructed to output the single token "TIE"
+    # and we only compare relative scores among these options.
     id_T = tokenizer("TIE", add_special_tokens=False).input_ids[0]
 
     vals = {
@@ -93,6 +110,9 @@ def map_lr_to_content(pred_lr: str, order: str) -> str:
     Map 'left/right' prediction to content-level A/B.
     order = "seq" means (A,B) => left=A, right=B
     order = "rev" means (B,A) => left=B, right=A
+
+    Here pred_lr is one of {"A", "B", "TIE"}, where "A" means "choose left",
+    "B" means "choose right", and "TIE" means tie.
     """
     if pred_lr == "TIE":
         return "TIE"
@@ -288,7 +308,7 @@ def compute_top_layers_and_bias_dirs(
         else:
             mean_scores.append(float(np.mean(scores)))
 
-    # Select top-3 layers (or fewer if the model has fewer layers)
+    # Select top-k layers (here we use up to 6 layers to steer more strongly)
     k = min(6, num_layers)
     sorted_idx = np.argsort(mean_scores)
     top_layers = sorted_idx[-k:].tolist()
@@ -310,8 +330,10 @@ def compute_top_layers_and_bias_dirs(
 
     print(f"[pca] Selected top layers: {top_layers}")
     for l in top_layers:
-        print(f"[pca] Layer {l}: mean influence = {mean_scores[l]:.4f}, "
-              f"subspace rank = {bias_dirs.get(int(l), torch.empty(0)).shape[0]}")
+        print(
+            f"[pca] Layer {l}: mean influence = {mean_scores[l]:.4f}, "
+            f"subspace rank = {bias_dirs.get(int(l), torch.empty(0)).shape[0]}"
+        )
     return top_layers, bias_dirs, mean_scores
 
 
@@ -332,7 +354,7 @@ def make_steering_hook(W: torch.Tensor, alpha: float = 1.0):
         if not isinstance(out, torch.Tensor):
             return out
         h = out
-        # 确保 W 和 h 在同一个 device & dtype
+        # Ensure W and h are on the same device & dtype
         W_local = W.to(device=h.device, dtype=h.dtype)
 
         coeff = torch.einsum("bsd,rd->bsr", h, W_local)
@@ -364,6 +386,65 @@ def register_steering_hooks(
     return handles
 
 
+# ---------- Generation-based judge for proposal-style evaluation ----------
+
+
+def parse_choice(text: str) -> str:
+    """
+    Parse the first occurrence of a decision token from generated text.
+    Normalize to: "A", "B", or "TIE".
+    """
+    for ch in text.strip():
+        up = ch.upper()
+        if up == "A":
+            return "A"
+        if up == "B":
+            return "B"
+        # Treat C / T / 3 as tie; also accept 'T' (start of "TIE")
+        if up in {"C", "T", "3"}:
+            return "TIE"
+        if up == "1":
+            return "A"
+        if up == "2":
+            return "B"
+    # If nothing useful appears, default to tie
+    return "TIE"
+
+
+def judge_pair_generate(
+    model: nn.Module,
+    tokenizer,
+    device: str,
+    question: str,
+    left_answer: str,
+    right_answer: str,
+    max_length: int = 2048,
+) -> str:
+    """
+    Build the judge prompt, let the model generate a short answer,
+    and parse it into "A"/"B"/"TIE".
+    """
+    prompt = build_judge_prompt(question, left_answer, right_answer)
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_length,
+    ).to(device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=4,
+            do_sample=False,
+            temperature=0.0,
+        )
+
+    new_tokens = outputs[0, inputs["input_ids"].shape[1]:]
+    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    return parse_choice(text)
+
+
 def evaluate_judge(
     model: nn.Module,
     tokenizer,
@@ -374,11 +455,20 @@ def evaluate_judge(
     alpha: Optional[float] = None,
 ) -> Dict[str, float]:
     """
-    Evaluate JudgeLM on a triplet dataset and compute:
-      - PAH_seq / PAH_rev (accuracy vs human, ignoring tie cases)
-      - left-choice rate (per non-tie case) for seq/rev
-      - tie rate for seq/rev
-      - PBI = left_rate_seq - left_rate_rev
+    Evaluate JudgeLM on a triplet dataset using proposal-style generation:
+
+      - For each example, run the judge twice:
+          * Sequential: Answer 1 = A, Answer 2 = B
+          * Reversed:   Answer 1 = B, Answer 2 = A
+      - The model generates a short completion, which is parsed into "A"/"B"/"TIE".
+      - These are mapped to content-level A/B using map_lr_to_content.
+      - We then compute:
+          * PAH_seq / PAH_rev (accuracy vs human)
+          * left-choice rate (per non-tie case)
+          * tie rate
+          * PBI = left_rate_seq - left_rate_rev
+          * avg_pah
+
     If bias_dirs/top_layers/alpha are provided, steering hooks are registered
     during evaluation (and removed afterward).
     """
@@ -409,12 +499,8 @@ def evaluate_judge(
             b = ex.get("answer_b", "")
             human = ex.get("human_preference", "TIE")
 
-            # Sequential (A,B)
-            prompt_seq = build_judge_prompt(q, a, b)
-            with torch.no_grad():
-                inputs_seq = tokenizer(prompt_seq, return_tensors="pt").to(device)
-                out_seq = model(**inputs_seq)
-                pred_seq_lr = decode_ab_tie_from_logits(out_seq.logits, tokenizer)
+            # Sequential (A,B): Answer 1 = A, Answer 2 = B
+            pred_seq_lr = judge_pair_generate(model, tokenizer, device, q, a, b)
             pred_seq_content = map_lr_to_content(pred_seq_lr, "seq")
 
             if pred_seq_lr == "TIE":
@@ -429,19 +515,15 @@ def evaluate_judge(
                 if pred_seq_content == human:
                     correct_seq += 1
 
-            # Reversed (B,A)
-            prompt_rev = build_judge_prompt(q, b, a)
-            with torch.no_grad():
-                inputs_rev = tokenizer(prompt_rev, return_tensors="pt").to(device)
-                out_rev = model(**inputs_rev)
-                pred_rev_lr = decode_ab_tie_from_logits(out_rev.logits, tokenizer)
+            # Reversed (B,A): Answer 1 = B, Answer 2 = A
+            pred_rev_lr = judge_pair_generate(model, tokenizer, device, q, b, a)
             pred_rev_content = map_lr_to_content(pred_rev_lr, "rev")
 
             if pred_rev_lr == "TIE":
                 tie_rev += 1
             else:
                 non_tie_rev += 1
-                if pred_rev_lr == "A":
+                if pred_rev_lr == "A":  # "A" means choose left, i.e., B in content space
                     left_rev += 1
 
             if human in ("A", "B") and pred_rev_content in ("A", "B"):
@@ -481,9 +563,15 @@ def evaluate_judge(
 
 def score_metrics(metrics: Dict[str, float], lambda_bias: float = 1.0) -> float:
     """
-    Simple scalar objective to pick alpha on the val set:
+    Scalar objective to pick alpha on the val set:
+
       score = avg_pah - lambda_bias * total_left_bias
-    where total_left_bias measures deviation of left-choice-rate from 0.5 on both orders.
+
+    where total_left_bias measures deviation of left-choice-rate from 0.5
+    on both sequential and reversed orders.
+
+    Larger lambda_bias means we care more about reducing left/right bias
+    (even at the cost of some PAH).
     """
     avg_pah = metrics.get("avg_pah", 0.0)
     left_seq = metrics.get("left_rate_seq", 0.0)
@@ -498,7 +586,7 @@ def score_metrics(metrics: Dict[str, float], lambda_bias: float = 1.0) -> float:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Align-Trace debias pipeline for JudgeLM.")
+    parser = argparse.ArgumentParser(description="Align-Trace debias pipeline for JudgeLM (proposal-style eval).")
     parser.add_argument("--model_name", required=True, help="HuggingFace model name or path for JudgeLM")
     parser.add_argument("--train", required=True, help="Train triplet JSONL path")
     parser.add_argument("--val", required=True, help="Validation triplet JSONL path")
@@ -549,7 +637,7 @@ def main() -> None:
         model.to(device)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    # Ensure EOS token exists; some judge models may need this
+    # Ensure pad token exists
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -571,7 +659,7 @@ def main() -> None:
         rank_r=args.rank_r,
     )
 
-    # 3) Evaluate on val to choose alpha
+    # 3) Evaluate on val to choose alpha (proposal-style generation-based eval)
     print("[val] Evaluating baseline on validation set...")
     val_baseline = evaluate_judge(
         model=model,
@@ -630,7 +718,7 @@ def main() -> None:
         json.dump(val_metrics_all, f, indent=2)
     print(f"[save] Saved validation metrics to: {metrics_val_path}")
 
-    # 4) Evaluate on test set (baseline vs debiased)
+    # 4) Evaluate on test set (baseline vs debiased) using the same proposal-style eval
     print("[test] Evaluating baseline on test set...")
     test_baseline = evaluate_judge(
         model=model,
