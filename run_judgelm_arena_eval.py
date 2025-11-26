@@ -115,24 +115,13 @@ def main():
     args = parser.parse_args()
 
     print(f"Loading model from {args.model_path} ...")
-    # 1. 加载 tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=False)
-
-    # 2. 决定用什么设备
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if device == "cuda" else torch.float32
-
-    # 3. 加载模型（不再用 device_map="auto"，也不 offload）
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
+        torch_dtype=torch.float16,
+        device_map="auto",
     )
-
-    # 4. 手动把模型移到对应设备
-    model.to(device)
-
-    print("Model loaded on", device)
+    device = model.device
 
     # 统计指标
     n_total = 0
