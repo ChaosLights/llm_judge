@@ -67,15 +67,15 @@ def load_triplet_data(path: str) -> List[Dict[str, Any]]:
 
 def build_judge_prompt(question: str, left_answer: str, right_answer: str) -> str:
     """Template for JudgeLM prompt where 'left_answer' is Answer 1 and 'right_answer' is Answer 2."""
-    return (
+    prompt = (
         "You are an impartial and strict judge.\n"
         "You will be given a user question and two candidate answers (Answer 1 and Answer 2).\n"
         "Your task is to decide which answer is better overall.\n\n"
         "Criteria include helpfulness, correctness, depth, safety, and following instructions.\n\n"
         "Read the question and both answers carefully, then output exactly ONE token:\n"
-        '- "A" if Answer 1 (left) is better\n'
-        '- "B" if Answer 2 (right) is better\n'
-        '- "TIE" if they are roughly tied\n\n"
+        "- \\\"A\\\" if Answer 1 (left) is better\n"
+        "- \\\"B\\\" if Answer 2 (right) is better\n"
+        "- \\\"TIE\\\" if they are roughly tied\n\n"
         "Do NOT explain your choice.\n\n"
         "[Question]\n"
         f"{question}\n\n"
@@ -85,6 +85,8 @@ def build_judge_prompt(question: str, left_answer: str, right_answer: str) -> st
         f"{right_answer}\n\n"
         "Your decision (A, B, or TIE):"
     )
+    return prompt
+
 
 
 def decode_ab_tie_from_logits(logits: torch.Tensor, tokenizer) -> str:
