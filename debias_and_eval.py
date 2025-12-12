@@ -1096,8 +1096,7 @@ def main() -> None:
         if args.do_finetune:
             # For SFT we need the model on a single device (no device_map).
             model = AutoModelForCausalLM.from_pretrained(
-                args.model_name,
-                torch_dtype=torch.float16,
+                args.model_name
             )
             model.to(device)
         else:
